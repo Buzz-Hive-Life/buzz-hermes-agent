@@ -2285,6 +2285,26 @@ class DiscordAdapter(BasePlatformAdapter):
         from gateway.platforms.base import resolve_channel_prompt
         return resolve_channel_prompt(self.config.extra, channel_id, parent_id)
 
+    def _discord_require_mention(self) -> bool:
+        """Return whether Discord channel messages require a bot mention."""
+        configured = self.config.extra.get("require_mention")
+        if configured is not None:
+            if isinstance(configured, str):
+                return configured.lower() not in ("false", "0", "no", "off")
+            return bool(configured)
+        return os.getenv("DISCORD_REQUIRE_MENTION", "true").lower() not in ("false", "0", "no", "off")
+
+    def _discord_free_response_channels(self) -> set:
+        """Return Discord channel IDs where no bot mention is required."""
+        raw = self.config.extra.get("free_response_channels")
+        if raw is None:
+            raw = os.getenv("DISCORD_FREE_RESPONSE_CHANNELS", "")
+        if isinstance(raw, list):
+            return {str(part).strip() for part in raw if str(part).strip()}
+        if isinstance(raw, str) and raw.strip():
+            return {part.strip() for part in raw.split(",") if part.strip()}
+        return set()
+
     def _thread_parent_channel(self, channel: Any) -> Any:
         """Return the parent text channel when invoked from a thread."""
         return getattr(channel, "parent", None) or channel
@@ -2387,8 +2407,15 @@ class DiscordAdapter(BasePlatformAdapter):
 
         Returns the created thread object, or ``None`` on failure.
         """
-        # Build a short thread name from the message
+        # Build a short thread name from the message. Strip Discord mention
+        # syntax (users / roles / channels) so thread titles don't end up
+        # showing raw <@id>, <@&id>, or <#id> markers — the ID isn't
+        # meaningful to humans glancing at the thread list (#6336).
         content = (message.content or "").strip()
+        # <@123>, <@!123>, <@&123>, <#123> — collapse to empty; normalize spaces.
+        content = re.sub(r"<@[!&]?\d+>", "", content)
+        content = re.sub(r"<#\d+>", "", content)
+        content = re.sub(r"\s+", " ", content).strip()
         thread_name = content[:80] if content else "Hermes"
         if len(content) > 80:
             thread_name = thread_name[:77] + "..."
@@ -2396,9 +2423,25 @@ class DiscordAdapter(BasePlatformAdapter):
         try:
             thread = await message.create_thread(name=thread_name, auto_archive_duration=1440)
             return thread
-        except Exception as e:
-            logger.warning("[%s] Auto-thread creation failed: %s", self.name, e)
-            return None
+        except Exception as direct_error:
+            display_name = getattr(getattr(message, "author", None), "display_name", None) or "unknown user"
+            reason = f"Auto-threaded from mention by {display_name}"
+            try:
+                seed_msg = await message.channel.send(f"\U0001f9f5 Thread created by Hermes: **{thread_name}**")
+                thread = await seed_msg.create_thread(
+                    name=thread_name,
+                    auto_archive_duration=1440,
+                    reason=reason,
+                )
+                return thread
+            except Exception as fallback_error:
+                logger.warning(
+                    "[%s] Auto-thread creation failed. Direct error: %s. Fallback error: %s",
+                    self.name,
+                    direct_error,
+                    fallback_error,
+                )
+                return None
 
     async def send_exec_approval(
         self, chat_id: str, command: str, session_key: str,
@@ -2745,12 +2788,11 @@ class DiscordAdapter(BasePlatformAdapter):
                 logger.debug("[%s] Ignoring message in ignored channel: %s", self.name, channel_ids)
                 return
 
-            free_channels_raw = os.getenv("DISCORD_FREE_RESPONSE_CHANNELS", "")
-            free_channels = {ch.strip() for ch in free_channels_raw.split(",") if ch.strip()}
+            free_channels = self._discord_free_response_channels()
             if parent_channel_id:
                 channel_ids.add(parent_channel_id)
 
-            require_mention = os.getenv("DISCORD_REQUIRE_MENTION", "true").lower() not in ("false", "0", "no")
+            require_mention = self._discord_require_mention()
             # Voice-linked text channels act as free-response while voice is active.
             # Only the exact bound channel gets the exemption, not sibling threads.
             voice_linked_ids = {str(ch_id) for ch_id in self._voice_text_channels.values()}
@@ -2778,9 +2820,10 @@ class DiscordAdapter(BasePlatformAdapter):
         if not is_thread and not isinstance(message.channel, discord.DMChannel):
             no_thread_channels_raw = os.getenv("DISCORD_NO_THREAD_CHANNELS", "")
             no_thread_channels = {ch.strip() for ch in no_thread_channels_raw.split(",") if ch.strip()}
-            skip_thread = bool(channel_ids & no_thread_channels)
+            skip_thread = bool(channel_ids & no_thread_channels) or is_free_channel
             auto_thread = os.getenv("DISCORD_AUTO_THREAD", "true").lower() in ("true", "1", "yes")
-            if auto_thread and not skip_thread and not is_voice_linked_channel:
+            is_reply_message = getattr(message, "type", None) == discord.MessageType.reply
+            if auto_thread and not skip_thread and not is_voice_linked_channel and not is_reply_message:
                 thread = await self._auto_create_thread(message)
                 if thread:
                     is_thread = True

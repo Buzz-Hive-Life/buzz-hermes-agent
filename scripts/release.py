@@ -241,6 +241,8 @@ AUTHOR_MAP = {
     "michel.belleau@malaiwah.com": "malaiwah",
     "gnanasekaran.sekareee@gmail.com": "gnanam1990",
     "jz.pentest@gmail.com": "0xyg3n",
+    "hypnosis.mda@gmail.com": "Hypn0sis",
+    "ywt000818@gmail.com": "OwenYWT",
     "dhandhalyabhavik@gmail.com": "v1k22",
     "rucchizhao@zhaochenfeideMacBook-Pro.local": "RucchiZ",
     "lehaolin98@outlook.com": "LehaoLin",
@@ -249,6 +251,10 @@ AUTHOR_MAP = {
     "bernylinville@devopsthink.org": "bernylinville",
     "brian@bde.io": "briandevans",
     "hubin_ll@qq.com": "LLQWQ",
+    "memosr_email@gmail.com": "memosr",
+    "anthhub@163.com": "anthhub",
+    "shenuu@gmail.com": "shenuu",
+    "xiayh17@gmail.com": "xiayh0107",
 }
 
 

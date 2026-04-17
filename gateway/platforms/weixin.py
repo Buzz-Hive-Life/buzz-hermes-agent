@@ -28,7 +28,7 @@ import uuid
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
-from urllib.parse import quote
+from urllib.parse import quote, urlparse
 
 logger = logging.getLogger(__name__)
 
@@ -97,6 +97,26 @@ MEDIA_FILE = 3
 MEDIA_VOICE = 4
 
 _LIVE_ADAPTERS: Dict[str, Any] = {}
+
+
+def _make_ssl_connector() -> Optional["aiohttp.TCPConnector"]:
+    """Return a TCPConnector with a certifi CA bundle, or None if certifi is unavailable.
+
+    Tencent's iLink server (``ilinkai.weixin.qq.com``) is not verifiable against
+    some system CA stores (notably Homebrew's OpenSSL on macOS Apple Silicon).
+    When ``certifi`` is installed, use its Mozilla CA bundle to guarantee
+    verification. Otherwise fall back to aiohttp's default (which honors
+    ``SSL_CERT_FILE`` env var via ``trust_env=True``).
+    """
+    try:
+        import ssl
+        import certifi
+    except ImportError:
+        return None
+    if not AIOHTTP_AVAILABLE:
+        return None
+    ssl_ctx = ssl.create_default_context(cafile=certifi.where())
+    return aiohttp.TCPConnector(ssl=ssl_ctx)
 
 ITEM_TEXT = 1
 ITEM_IMAGE = 2
@@ -400,7 +420,12 @@ async def _send_message(
     text: str,
     context_token: Optional[str],
     client_id: str,
-) -> None:
+) -> Dict[str, Any]:
+    """Send a text message via iLink sendmessage API.
+
+    Returns the raw API response dict (may contain error codes like
+    ``errcode: -14`` for session expiry that the caller can inspect).
+    """
     if not text or not text.strip():
         raise ValueError("_send_message: text must not be empty")
     message: Dict[str, Any] = {
@@ -413,7 +438,7 @@ async def _send_message(
     }
     if context_token:
         message["context_token"] = context_token
-    await _api_post(
+    return await _api_post(
         session,
         base_url=base_url,
         endpoint=EP_SEND_MESSAGE,
@@ -535,6 +560,39 @@ async def _download_bytes(
         return await response.read()
 
 
+_WEIXIN_CDN_ALLOWLIST: frozenset[str] = frozenset(
+    {
+        "novac2c.cdn.weixin.qq.com",
+        "ilinkai.weixin.qq.com",
+        "wx.qlogo.cn",
+        "thirdwx.qlogo.cn",
+        "res.wx.qq.com",
+        "mmbiz.qpic.cn",
+        "mmbiz.qlogo.cn",
+    }
+)
+
+
+def _assert_weixin_cdn_url(url: str) -> None:
+    """Raise ValueError if *url* does not point at a known WeChat CDN host."""
+    try:
+        parsed = urlparse(url)
+        scheme = parsed.scheme.lower()
+        host = parsed.hostname or ""
+    except Exception as exc:  # noqa: BLE001
+        raise ValueError(f"Unparseable media URL: {url!r}") from exc
+
+    if scheme not in ("http", "https"):
+        raise ValueError(
+            f"Media URL has disallowed scheme {scheme!r}; only http/https are permitted."
+        )
+    if host not in _WEIXIN_CDN_ALLOWLIST:
+        raise ValueError(
+            f"Media URL host {host!r} is not in the WeChat CDN allowlist. "
+            "Refusing to fetch to prevent SSRF."
+        )
+
+
 def _media_reference(item: Dict[str, Any], key: str) -> Dict[str, Any]:
     return (item.get(key) or {}).get("media") or {}
 
@@ -555,6 +613,7 @@ async def _download_and_decrypt_media(
             timeout_seconds=timeout_seconds,
         )
     elif full_url:
+        _assert_weixin_cdn_url(full_url)
         raw = await _download_bytes(session, url=full_url, timeout_seconds=timeout_seconds)
     else:
         raise RuntimeError("media item had neither encrypt_query_param nor full_url")
@@ -930,7 +989,7 @@ async def qr_login(
     if not AIOHTTP_AVAILABLE:
         raise RuntimeError("aiohttp is required for Weixin QR login")
 
-    async with aiohttp.ClientSession(trust_env=True) as session:
+    async with aiohttp.ClientSession(trust_env=True, connector=_make_ssl_connector()) as session:
         try:
             qr_resp = await _api_get(
                 session,
@@ -948,6 +1007,10 @@ async def qr_login(
             logger.error("weixin: QR response missing qrcode")
             return None
 
+        # qrcode_url is the full scannable liteapp URL; qrcode_value is just the hex token
+        # WeChat needs to scan the full URL, not the raw hex string
+        qr_scan_data = qrcode_url if qrcode_url else qrcode_value
+
         print("\n请使用微信扫描以下二维码：")
         if qrcode_url:
             print(qrcode_url)
@@ -955,11 +1018,11 @@ async def qr_login(
             import qrcode
 
             qr = qrcode.QRCode()
-            qr.add_data(qrcode_url or qrcode_value)
+            qr.add_data(qr_scan_data)
             qr.make(fit=True)
             qr.print_ascii(invert=True)
-        except Exception:
-            print("（终端二维码渲染失败，请直接打开上面的二维码链接）")
+        except Exception as _qr_exc:
+            print(f"（终端二维码渲染失败: {_qr_exc}，请直接打开上面的二维码链接）")
 
         deadline = time.time() + timeout_seconds
         current_base_url = ILINK_BASE_URL
@@ -1005,8 +1068,17 @@ async def qr_login(
                     )
                     qrcode_value = str(qr_resp.get("qrcode") or "")
                     qrcode_url = str(qr_resp.get("qrcode_img_content") or "")
+                    qr_scan_data = qrcode_url if qrcode_url else qrcode_value
                     if qrcode_url:
                         print(qrcode_url)
+                    try:
+                        import qrcode as _qrcode
+                        qr = _qrcode.QRCode()
+                        qr.add_data(qr_scan_data)
+                        qr.make(fit=True)
+                        qr.print_ascii(invert=True)
+                    except Exception:
+                        pass
                 except Exception as exc:
                     logger.error("weixin: QR refresh failed: %s", exc)
                     return None
@@ -1130,8 +1202,8 @@ class WeixinAdapter(BasePlatformAdapter):
         except Exception as exc:
             logger.debug("[%s] Token lock unavailable (non-fatal): %s", self.name, exc)
 
-        self._poll_session = aiohttp.ClientSession(trust_env=True)
-        self._send_session = aiohttp.ClientSession(trust_env=True)
+        self._poll_session = aiohttp.ClientSession(trust_env=True, connector=_make_ssl_connector())
+        self._send_session = aiohttp.ClientSession(trust_env=True, connector=_make_ssl_connector())
         self._token_store.restore(self._account_id)
         self._poll_task = asyncio.create_task(self._poll_loop(), name="weixin-poll")
         self._mark_connected()
@@ -1418,11 +1490,18 @@ class WeixinAdapter(BasePlatformAdapter):
         context_token: Optional[str],
         client_id: str,
     ) -> None:
-        """Send a single text chunk with per-chunk retry and backoff."""
+        """Send a single text chunk with per-chunk retry and backoff.
+
+        On session-expired errors (errcode -14), automatically retries
+        *without* ``context_token`` — iLink accepts tokenless sends as a
+        degraded fallback, which keeps cron-initiated push messages working
+        even when no user message has refreshed the session recently.
+        """
         last_error: Optional[Exception] = None
+        retried_without_token = False
         for attempt in range(self._send_chunk_retries + 1):
             try:
-                await _send_message(
+                resp = await _send_message(
                     self._send_session,
                     base_url=self._base_url,
                     token=self._token,
@@ -1431,6 +1510,31 @@ class WeixinAdapter(BasePlatformAdapter):
                     context_token=context_token,
                     client_id=client_id,
                 )
+                # Check iLink response for session-expired error
+                if resp and isinstance(resp, dict):
+                    ret = resp.get("ret")
+                    errcode = resp.get("errcode")
+                    if (ret is not None and ret not in (0,)) or (errcode is not None and errcode not in (0,)):
+                        is_session_expired = (
+                            ret == SESSION_EXPIRED_ERRCODE
+                            or errcode == SESSION_EXPIRED_ERRCODE
+                        )
+                        # Session expired — strip token and retry once
+                        if is_session_expired and not retried_without_token and context_token:
+                            retried_without_token = True
+                            context_token = None
+                            self._token_store._cache.pop(
+                                self._token_store._key(self._account_id, chat_id), None
+                            )
+                            logger.warning(
+                                "[%s] session expired for %s; retrying without context_token",
+                                self.name, _safe_id(chat_id),
+                            )
+                            continue
+                        errmsg = resp.get("errmsg") or resp.get("msg") or "unknown error"
+                        raise RuntimeError(
+                            f"iLink sendmessage error: ret={ret} errcode={errcode} errmsg={errmsg}"
+                        )
                 return
             except Exception as exc:
                 last_error = exc
@@ -1581,23 +1685,34 @@ class WeixinAdapter(BasePlatformAdapter):
         self,
         chat_id: str,
         image_path: str,
-        caption: str = "",
+        caption: Optional[str] = None,
         reply_to: Optional[str] = None,
         metadata: Optional[Dict[str, Any]] = None,
+        **kwargs,
     ) -> SendResult:
-        return await self.send_document(chat_id, file_path=image_path, caption=caption, metadata=metadata)
+        del reply_to, kwargs
+        return await self.send_document(
+            chat_id=chat_id,
+            file_path=image_path,
+            caption=caption,
+            metadata=metadata,
+        )
 
     async def send_document(
         self,
         chat_id: str,
         file_path: str,
-        caption: str = "",
+        caption: Optional[str] = None,
+        file_name: Optional[str] = None,
+        reply_to: Optional[str] = None,
         metadata: Optional[Dict[str, Any]] = None,
+        **kwargs,
     ) -> SendResult:
+        del file_name, reply_to, metadata, kwargs
         if not self._send_session or not self._token:
             return SendResult(success=False, error="Not connected")
         try:
-            message_id = await self._send_file(chat_id, file_path, caption)
+            message_id = await self._send_file(chat_id, file_path, caption or "")
             return SendResult(success=True, message_id=message_id)
         except Exception as exc:
             logger.error("[%s] send_document failed to=%s: %s", self.name, _safe_id(chat_id), exc)
@@ -1707,7 +1822,6 @@ class WeixinAdapter(BasePlatformAdapter):
             ciphertext=ciphertext,
             upload_url=upload_url,
         )
-
         context_token = self._token_store.get(self._account_id, chat_id)
         # The iLink API expects aes_key as base64(hex_string), not base64(raw_bytes).
         # Sending base64(raw_bytes) causes images to show as grey boxes on the
@@ -1893,7 +2007,7 @@ async def send_weixin_direct(
             "context_token_used": bool(context_token),
         }
 
-    async with aiohttp.ClientSession(trust_env=True) as session:
+    async with aiohttp.ClientSession(trust_env=True, connector=_make_ssl_connector()) as session:
         adapter = WeixinAdapter(
             PlatformConfig(
                 enabled=True,

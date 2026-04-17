@@ -96,6 +96,8 @@ MEDIA_VIDEO = 2
 MEDIA_FILE = 3
 MEDIA_VOICE = 4
 
+_LIVE_ADAPTERS: Dict[str, Any] = {}
+
 ITEM_TEXT = 1
 ITEM_IMAGE = 2
 ITEM_VOICE = 3
@@ -623,42 +625,31 @@ def _rewrite_table_block_for_weixin(lines: List[str]) -> str:
 def _normalize_markdown_blocks(content: str) -> str:
     lines = content.splitlines()
     result: List[str] = []
-    i = 0
     in_code_block = False
+    blank_run = 0
 
-    while i < len(lines):
-        line = lines[i].rstrip()
-        fence_match = _FENCE_RE.match(line.strip())
-        if fence_match:
+    for raw_line in lines:
+        line = raw_line.rstrip()
+        if _FENCE_RE.match(line.strip()):
             in_code_block = not in_code_block
             result.append(line)
-            i += 1
+            blank_run = 0
             continue
 
         if in_code_block:
             result.append(line)
-            i += 1
             continue
 
-        if (
-            i + 1 < len(lines)
-            and "|" in lines[i]
-            and _TABLE_RULE_RE.match(lines[i + 1].rstrip())
-        ):
-            table_lines = [lines[i].rstrip(), lines[i + 1].rstrip()]
-            i += 2
-            while i < len(lines) and "|" in lines[i]:
-                table_lines.append(lines[i].rstrip())
-                i += 1
-            result.append(_rewrite_table_block_for_weixin(table_lines))
+        if not line.strip():
+            blank_run += 1
+            if blank_run <= 1:
+                result.append("")
             continue
 
-        result.append(_MARKDOWN_LINK_RE.sub(r"\1 (\2)", _rewrite_headers_for_weixin(line)))
-        i += 1
+        blank_run = 0
+        result.append(line)
 
-    normalized = "\n".join(item.rstrip() for item in result)
-    normalized = re.sub(r"\n{3,}", "\n\n", normalized)
-    return normalized.strip()
+    return "\n".join(result).strip()
 
 
 def _split_markdown_blocks(content: str) -> List[str]:
@@ -704,8 +695,8 @@ def _split_delivery_units_for_weixin(content: str) -> List[str]:
 
     Weixin can render Markdown, but chat readability is better when top-level
     line breaks become separate messages. Keep fenced code blocks intact and
-    attach indented continuation lines to the previous top-level line so
-    transformed tables/lists do not get torn apart.
+    attach indented continuation lines to the previous top-level line so nested
+    list items do not get torn apart.
     """
     units: List[str] = []
 
@@ -747,7 +738,9 @@ def _looks_like_chatty_line_for_weixin(line: str) -> bool:
         return False
     if line.startswith((" ", "\t")):
         return False
-    if stripped.startswith((">", "-", "*", "【")):
+    if stripped.startswith((">", "-", "*", "【", "#", "|")):
+        return False
+    if _TABLE_RULE_RE.match(stripped):
         return False
     if re.match(r"^\*\*[^*]+\*\*$", stripped):
         return False
@@ -757,10 +750,12 @@ def _looks_like_chatty_line_for_weixin(line: str) -> bool:
 
 
 def _looks_like_heading_line_for_weixin(line: str) -> bool:
-    """Return True when a short line behaves like a plain-text heading."""
+    """Return True when a short line behaves like a heading."""
     stripped = line.strip()
     if not stripped:
         return False
+    if _HEADER_RE.match(stripped):
+        return True
     return len(stripped) <= 24 and stripped.endswith((":", "："))
 
 
@@ -1059,7 +1054,8 @@ class WeixinAdapter(BasePlatformAdapter):
         self._hermes_home = hermes_home
         self._token_store = ContextTokenStore(hermes_home)
         self._typing_cache = TypingTicketCache()
-        self._session: Optional[aiohttp.ClientSession] = None
+        self._poll_session: Optional[aiohttp.ClientSession] = None
+        self._send_session: Optional[aiohttp.ClientSession] = None
         self._poll_task: Optional[asyncio.Task] = None
         self._dedup = MessageDeduplicator(ttl_seconds=MESSAGE_DEDUP_TTL_SECONDS)
 
@@ -1134,14 +1130,17 @@ class WeixinAdapter(BasePlatformAdapter):
         except Exception as exc:
             logger.debug("[%s] Token lock unavailable (non-fatal): %s", self.name, exc)
 
-        self._session = aiohttp.ClientSession(trust_env=True)
+        self._poll_session = aiohttp.ClientSession(trust_env=True)
+        self._send_session = aiohttp.ClientSession(trust_env=True)
         self._token_store.restore(self._account_id)
         self._poll_task = asyncio.create_task(self._poll_loop(), name="weixin-poll")
         self._mark_connected()
+        _LIVE_ADAPTERS[self._token] = self
         logger.info("[%s] Connected account=%s base=%s", self.name, _safe_id(self._account_id), self._base_url)
         return True
 
     async def disconnect(self) -> None:
+        _LIVE_ADAPTERS.pop(self._token, None)
         self._running = False
         if self._poll_task and not self._poll_task.done():
             self._poll_task.cancel()
@@ -1150,15 +1149,18 @@ class WeixinAdapter(BasePlatformAdapter):
             except asyncio.CancelledError:
                 pass
         self._poll_task = None
-        if self._session and not self._session.closed:
-            await self._session.close()
-        self._session = None
+        if self._poll_session and not self._poll_session.closed:
+            await self._poll_session.close()
+        self._poll_session = None
+        if self._send_session and not self._send_session.closed:
+            await self._send_session.close()
+        self._send_session = None
         self._release_platform_lock()
         self._mark_disconnected()
         logger.info("[%s] Disconnected", self.name)
 
     async def _poll_loop(self) -> None:
-        assert self._session is not None
+        assert self._poll_session is not None
         sync_buf = _load_sync_buf(self._hermes_home, self._account_id)
         timeout_ms = LONG_POLL_TIMEOUT_MS
         consecutive_failures = 0
@@ -1166,7 +1168,7 @@ class WeixinAdapter(BasePlatformAdapter):
         while self._running:
             try:
                 response = await _get_updates(
-                    self._session,
+                    self._poll_session,
                     base_url=self._base_url,
                     token=self._token,
                     sync_buf=sync_buf,
@@ -1223,7 +1225,7 @@ class WeixinAdapter(BasePlatformAdapter):
             logger.error("[%s] unhandled inbound error from=%s: %s", self.name, _safe_id(message.get("from_user_id")), exc, exc_info=True)
 
     async def _process_message(self, message: Dict[str, Any]) -> None:
-        assert self._session is not None
+        assert self._poll_session is not None
         sender_id = str(message.get("from_user_id") or "").strip()
         if not sender_id:
             return
@@ -1316,7 +1318,7 @@ class WeixinAdapter(BasePlatformAdapter):
         media = _media_reference(item, "image_item")
         try:
             data = await _download_and_decrypt_media(
-                self._session,
+                self._poll_session,
                 cdn_base_url=self._cdn_base_url,
                 encrypted_query_param=media.get("encrypt_query_param"),
                 aes_key_b64=(item.get("image_item") or {}).get("aeskey")
@@ -1334,7 +1336,7 @@ class WeixinAdapter(BasePlatformAdapter):
         media = _media_reference(item, "video_item")
         try:
             data = await _download_and_decrypt_media(
-                self._session,
+                self._poll_session,
                 cdn_base_url=self._cdn_base_url,
                 encrypted_query_param=media.get("encrypt_query_param"),
                 aes_key_b64=media.get("aes_key"),
@@ -1353,7 +1355,7 @@ class WeixinAdapter(BasePlatformAdapter):
         mime = _mime_from_filename(filename)
         try:
             data = await _download_and_decrypt_media(
-                self._session,
+                self._poll_session,
                 cdn_base_url=self._cdn_base_url,
                 encrypted_query_param=media.get("encrypt_query_param"),
                 aes_key_b64=media.get("aes_key"),
@@ -1372,7 +1374,7 @@ class WeixinAdapter(BasePlatformAdapter):
             return None
         try:
             data = await _download_and_decrypt_media(
-                self._session,
+                self._poll_session,
                 cdn_base_url=self._cdn_base_url,
                 encrypted_query_param=media.get("encrypt_query_param"),
                 aes_key_b64=media.get("aes_key"),
@@ -1385,13 +1387,13 @@ class WeixinAdapter(BasePlatformAdapter):
             return None
 
     async def _maybe_fetch_typing_ticket(self, user_id: str, context_token: Optional[str]) -> None:
-        if not self._session or not self._token:
+        if not self._poll_session or not self._token:
             return
         if self._typing_cache.get(user_id):
             return
         try:
             response = await _get_config(
-                self._session,
+                self._poll_session,
                 base_url=self._base_url,
                 token=self._token,
                 user_id=user_id,
@@ -1421,7 +1423,7 @@ class WeixinAdapter(BasePlatformAdapter):
         for attempt in range(self._send_chunk_retries + 1):
             try:
                 await _send_message(
-                    self._session,
+                    self._send_session,
                     base_url=self._base_url,
                     token=self._token,
                     to=chat_id,
@@ -1456,12 +1458,48 @@ class WeixinAdapter(BasePlatformAdapter):
         reply_to: Optional[str] = None,
         metadata: Optional[Dict[str, Any]] = None,
     ) -> SendResult:
-        if not self._session or not self._token:
+        if not self._send_session or not self._token:
             return SendResult(success=False, error="Not connected")
         context_token = self._token_store.get(self._account_id, chat_id)
         last_message_id: Optional[str] = None
+
+        # Extract MEDIA: tags and bare local file paths before text delivery.
+        media_files, cleaned_content = self.extract_media(content)
+        _, image_cleaned = self.extract_images(cleaned_content)
+        local_files, final_content = self.extract_local_files(image_cleaned)
+
+        _AUDIO_EXTS = {".ogg", ".opus", ".mp3", ".wav", ".m4a"}
+        _VIDEO_EXTS = {".mp4", ".mov", ".avi", ".mkv", ".webm", ".3gp"}
+        _IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".gif"}
+
+        async def _deliver_media(path: str, is_voice: bool = False) -> None:
+            ext = Path(path).suffix.lower()
+            if is_voice or ext in _AUDIO_EXTS:
+                await self.send_voice(chat_id=chat_id, audio_path=path, metadata=metadata)
+            elif ext in _VIDEO_EXTS:
+                await self.send_video(chat_id=chat_id, video_path=path, metadata=metadata)
+            elif ext in _IMAGE_EXTS:
+                await self.send_image_file(chat_id=chat_id, image_path=path, metadata=metadata)
+            else:
+                await self.send_document(chat_id=chat_id, file_path=path, metadata=metadata)
+
         try:
-            chunks = [c for c in self._split_text(self.format_message(content)) if c and c.strip()]
+            # Deliver extracted MEDIA: attachments first.
+            for media_path, is_voice in media_files:
+                try:
+                    await _deliver_media(media_path, is_voice)
+                except Exception as exc:
+                    logger.warning("[%s] media delivery failed for %s: %s", self.name, media_path, exc)
+
+            # Deliver bare local file paths.
+            for file_path in local_files:
+                try:
+                    await _deliver_media(file_path, is_voice=False)
+                except Exception as exc:
+                    logger.warning("[%s] local file delivery failed for %s: %s", self.name, file_path, exc)
+
+            # Deliver text content.
+            chunks = [c for c in self._split_text(self.format_message(final_content)) if c and c.strip()]
             for idx, chunk in enumerate(chunks):
                 client_id = f"hermes-weixin-{uuid.uuid4().hex}"
                 await self._send_text_chunk(
@@ -1479,14 +1517,14 @@ class WeixinAdapter(BasePlatformAdapter):
             return SendResult(success=False, error=str(exc))
 
     async def send_typing(self, chat_id: str, metadata: Optional[Dict[str, Any]] = None) -> None:
-        if not self._session or not self._token:
+        if not self._send_session or not self._token:
             return
         typing_ticket = self._typing_cache.get(chat_id)
         if not typing_ticket:
             return
         try:
             await _send_typing(
-                self._session,
+                self._send_session,
                 base_url=self._base_url,
                 token=self._token,
                 to_user_id=chat_id,
@@ -1497,14 +1535,14 @@ class WeixinAdapter(BasePlatformAdapter):
             logger.debug("[%s] typing start failed for %s: %s", self.name, _safe_id(chat_id), exc)
 
     async def stop_typing(self, chat_id: str) -> None:
-        if not self._session or not self._token:
+        if not self._send_session or not self._token:
             return
         typing_ticket = self._typing_cache.get(chat_id)
         if not typing_ticket:
             return
         try:
             await _send_typing(
-                self._session,
+                self._send_session,
                 base_url=self._base_url,
                 token=self._token,
                 to_user_id=chat_id,
@@ -1542,12 +1580,12 @@ class WeixinAdapter(BasePlatformAdapter):
     async def send_image_file(
         self,
         chat_id: str,
-        path: str,
+        image_path: str,
         caption: str = "",
         reply_to: Optional[str] = None,
         metadata: Optional[Dict[str, Any]] = None,
     ) -> SendResult:
-        return await self.send_document(chat_id, file_path=path, caption=caption, metadata=metadata)
+        return await self.send_document(chat_id, file_path=image_path, caption=caption, metadata=metadata)
 
     async def send_document(
         self,
@@ -1556,7 +1594,7 @@ class WeixinAdapter(BasePlatformAdapter):
         caption: str = "",
         metadata: Optional[Dict[str, Any]] = None,
     ) -> SendResult:
-        if not self._session or not self._token:
+        if not self._send_session or not self._token:
             return SendResult(success=False, error="Not connected")
         try:
             message_id = await self._send_file(chat_id, file_path, caption)
@@ -1573,7 +1611,7 @@ class WeixinAdapter(BasePlatformAdapter):
         reply_to: Optional[str] = None,
         metadata: Optional[Dict[str, Any]] = None,
     ) -> SendResult:
-        if not self._session or not self._token:
+        if not self._send_session or not self._token:
             return SendResult(success=False, error="Not connected")
         try:
             message_id = await self._send_file(chat_id, video_path, caption or "")
@@ -1590,7 +1628,24 @@ class WeixinAdapter(BasePlatformAdapter):
         reply_to: Optional[str] = None,
         metadata: Optional[Dict[str, Any]] = None,
     ) -> SendResult:
-        return await self.send_document(chat_id, audio_path, caption=caption or "", metadata=metadata)
+        if not self._send_session or not self._token:
+            return SendResult(success=False, error="Not connected")
+
+        # Native outbound Weixin voice bubbles are not proven-working in the
+        # upstream reference implementation. Prefer a reliable file attachment
+        # fallback so users at least receive playable audio, even for .silk.
+        fallback_caption = caption or "[voice message as attachment]"
+        try:
+            message_id = await self._send_file(
+                chat_id,
+                audio_path,
+                fallback_caption,
+                force_file_attachment=True,
+            )
+            return SendResult(success=True, message_id=message_id)
+        except Exception as exc:
+            logger.error("[%s] send_voice failed to=%s: %s", self.name, _safe_id(chat_id), exc)
+            return SendResult(success=False, error=str(exc))
 
     async def _download_remote_media(self, url: str) -> str:
         from tools.url_safety import is_safe_url
@@ -1598,8 +1653,8 @@ class WeixinAdapter(BasePlatformAdapter):
         if not is_safe_url(url):
             raise ValueError(f"Blocked unsafe URL (SSRF protection): {url}")
 
-        assert self._session is not None
-        async with self._session.get(url, timeout=aiohttp.ClientTimeout(total=30)) as response:
+        assert self._send_session is not None
+        async with self._send_session.get(url, timeout=aiohttp.ClientTimeout(total=30)) as response:
             response.raise_for_status()
             data = await response.read()
             suffix = Path(url.split("?", 1)[0]).suffix or ".bin"
@@ -1607,16 +1662,22 @@ class WeixinAdapter(BasePlatformAdapter):
             handle.write(data)
             return handle.name
 
-    async def _send_file(self, chat_id: str, path: str, caption: str) -> str:
-        assert self._session is not None and self._token is not None
+    async def _send_file(
+        self,
+        chat_id: str,
+        path: str,
+        caption: str,
+        force_file_attachment: bool = False,
+    ) -> str:
+        assert self._send_session is not None and self._token is not None
         plaintext = Path(path).read_bytes()
-        media_type, item_builder = self._outbound_media_builder(path)
+        media_type, item_builder = self._outbound_media_builder(path, force_file_attachment=force_file_attachment)
         filekey = secrets.token_hex(16)
         aes_key = secrets.token_bytes(16)
         rawsize = len(plaintext)
         rawfilemd5 = hashlib.md5(plaintext).hexdigest()
         upload_response = await _get_upload_url(
-            self._session,
+            self._send_session,
             base_url=self._base_url,
             token=self._token,
             to_user_id=chat_id,
@@ -1642,7 +1703,7 @@ class WeixinAdapter(BasePlatformAdapter):
             raise RuntimeError(f"getUploadUrl returned neither upload_param nor upload_full_url: {upload_response}")
 
         encrypted_query_param = await _upload_ciphertext(
-            self._session,
+            self._send_session,
             ciphertext=ciphertext,
             upload_url=upload_url,
         )
@@ -1652,20 +1713,25 @@ class WeixinAdapter(BasePlatformAdapter):
         # Sending base64(raw_bytes) causes images to show as grey boxes on the
         # receiver side because the decryption key doesn't match.
         aes_key_for_api = base64.b64encode(aes_key.hex().encode("ascii")).decode("ascii")
-        media_item = item_builder(
-            encrypt_query_param=encrypted_query_param,
-            aes_key_for_api=aes_key_for_api,
-            ciphertext_size=len(ciphertext),
-            plaintext_size=rawsize,
-            filename=Path(path).name,
-            rawfilemd5=rawfilemd5,
-        )
+        item_kwargs = {
+            "encrypt_query_param": encrypted_query_param,
+            "aes_key_for_api": aes_key_for_api,
+            "ciphertext_size": len(ciphertext),
+            "plaintext_size": rawsize,
+            "filename": Path(path).name,
+            "rawfilemd5": rawfilemd5,
+        }
+        if media_type == MEDIA_VOICE and path.endswith(".silk"):
+            item_kwargs["encode_type"] = 6
+            item_kwargs["sample_rate"] = 24000
+            item_kwargs["bits_per_sample"] = 16
+        media_item = item_builder(**item_kwargs)
 
         last_message_id = None
         if caption:
             last_message_id = f"hermes-weixin-{uuid.uuid4().hex}"
             await _send_message(
-                self._session,
+                self._send_session,
                 base_url=self._base_url,
                 token=self._token,
                 to=chat_id,
@@ -1676,7 +1742,7 @@ class WeixinAdapter(BasePlatformAdapter):
 
         last_message_id = f"hermes-weixin-{uuid.uuid4().hex}"
         await _api_post(
-            self._session,
+            self._send_session,
             base_url=self._base_url,
             endpoint=EP_SEND_MESSAGE,
             payload={
@@ -1695,7 +1761,7 @@ class WeixinAdapter(BasePlatformAdapter):
         )
         return last_message_id
 
-    def _outbound_media_builder(self, path: str):
+    def _outbound_media_builder(self, path: str, force_file_attachment: bool = False):
         mime = mimetypes.guess_type(path)[0] or "application/octet-stream"
         if mime.startswith("image/"):
             return MEDIA_IMAGE, lambda **kw: {
@@ -1723,7 +1789,7 @@ class WeixinAdapter(BasePlatformAdapter):
                     "video_md5": kw.get("rawfilemd5", ""),
                 },
             }
-        if mime.startswith("audio/") or path.endswith(".silk"):
+        if path.endswith(".silk") and not force_file_attachment:
             return MEDIA_VOICE, lambda **kw: {
                 "type": ITEM_VOICE,
                 "voice_item": {
@@ -1732,7 +1798,23 @@ class WeixinAdapter(BasePlatformAdapter):
                         "aes_key": kw["aes_key_for_api"],
                         "encrypt_type": 1,
                     },
+                    "encode_type": kw.get("encode_type"),
+                    "bits_per_sample": kw.get("bits_per_sample"),
+                    "sample_rate": kw.get("sample_rate"),
                     "playtime": kw.get("playtime", 0),
+                },
+            }
+        if mime.startswith("audio/"):
+            return MEDIA_FILE, lambda **kw: {
+                "type": ITEM_FILE,
+                "file_item": {
+                    "media": {
+                        "encrypt_query_param": kw["encrypt_query_param"],
+                        "aes_key": kw["aes_key_for_api"],
+                        "encrypt_type": 1,
+                    },
+                    "file_name": kw["filename"],
+                    "len": str(kw["plaintext_size"]),
                 },
             }
         return MEDIA_FILE, lambda **kw: {
@@ -1784,6 +1866,33 @@ async def send_weixin_direct(
     token_store.restore(account_id)
     context_token = token_store.get(account_id, chat_id)
 
+    live_adapter = _LIVE_ADAPTERS.get(resolved_token)
+    send_session = getattr(live_adapter, '_send_session', None)
+    if live_adapter is not None and send_session is not None and not send_session.closed:
+        last_result: Optional[SendResult] = None
+        cleaned = live_adapter.format_message(message)
+        if cleaned:
+            last_result = await live_adapter.send(chat_id, cleaned)
+            if not last_result.success:
+                return {"error": f"Weixin send failed: {last_result.error}"}
+
+        for media_path, _is_voice in media_files or []:
+            ext = Path(media_path).suffix.lower()
+            if ext in {".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp"}:
+                last_result = await live_adapter.send_image_file(chat_id, media_path)
+            else:
+                last_result = await live_adapter.send_document(chat_id, media_path)
+            if not last_result.success:
+                return {"error": f"Weixin media send failed: {last_result.error}"}
+
+        return {
+            "success": True,
+            "platform": "weixin",
+            "chat_id": chat_id,
+            "message_id": last_result.message_id if last_result else None,
+            "context_token_used": bool(context_token),
+        }
+
     async with aiohttp.ClientSession(trust_env=True) as session:
         adapter = WeixinAdapter(
             PlatformConfig(
@@ -1797,6 +1906,7 @@ async def send_weixin_direct(
                 },
             )
         )
+        adapter._send_session = session
         adapter._session = session
         adapter._token = resolved_token
         adapter._account_id = account_id

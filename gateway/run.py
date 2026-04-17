@@ -355,7 +355,7 @@ def _resolve_runtime_agent_kwargs() -> dict:
     except Exception as exc:
         raise RuntimeError(format_runtime_provider_error(exc)) from exc
 
-    return {
+    kwargs = {
         "api_key": runtime.get("api_key"),
         "base_url": runtime.get("base_url"),
         "provider": runtime.get("provider"),
@@ -364,6 +364,20 @@ def _resolve_runtime_agent_kwargs() -> dict:
         "args": list(runtime.get("args") or []),
         "credential_pool": runtime.get("credential_pool"),
     }
+
+    # Read max_tokens from config.yaml so gateway-created agents honor the
+    # user-configured output token limit (model.max_tokens).
+    try:
+        cfg = _load_gateway_config()
+        model_cfg = cfg.get("model", {})
+        if isinstance(model_cfg, dict):
+            mt = model_cfg.get("max_tokens")
+            if mt is not None:
+                kwargs["max_tokens"] = int(mt)
+    except Exception:
+        pass  # max_tokens is optional — don't break agent init
+
+    return kwargs
 
 
 def _build_media_placeholder(event) -> str:
